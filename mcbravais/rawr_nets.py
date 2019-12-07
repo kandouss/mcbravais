@@ -1,10 +1,11 @@
-import os
+import os, sys, glob
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import gym
 import numpy as np
 from contextlib import contextmanager
+import itertools
 
 from spacelib.flatter import Flatter
 from .awr_nets import (
@@ -34,7 +35,9 @@ class RecurrentAWRAgent(object):
             'policy_trunk_hidden': [512, 512, 512],
             'value_function_hidden': [512, 512, 512],
             'beta': 1.0,
-            'learning_rate': 1.e-3
+            'gamma': 0.99,
+            'learning_rate': 1.e-3,
+            'value_function_scaling': 'log1p'
             }
 
     def __init__(self, observation_space, action_space, params={}):
@@ -110,7 +113,7 @@ class RecurrentAWRAgent(object):
     def end_episode(self):
         self.hx = None
 
-    def get_action(self, obs, update_hx=True, sample=True):
+    def get_action(self, obs, update_hx=True, sample=True, writer=None):
         with torch.no_grad(), self.state_encoder.to_eval(), self.policy.to_eval():
             o = [np.atleast_1d(x).copy() for x in self.obsflat.flatten(obs)]
             obs_tensor = to_tensors(o, dtype=torch.float32, device=self.device)
@@ -120,9 +123,15 @@ class RecurrentAWRAgent(object):
             act, mu, lp = self.policy(latent)
 
             if sample:
-                return self.policy.interpret(act)
+                res = self.policy.interpret(act)
             else:
-                return self.policy.interpret(mu)
+                res = self.policy.interpret(mu)
+            
+            if writer:
+                writer.add_scalar('policy/camera0', res['camera'][0], period=10)
+                writer.add_scalar('policy/camera1', res['camera'][1], period=10)
+                writer.add_scalar('policy/attack', res['attack'], period=10)
+            return res
 
     @property
     def netdict(self):
@@ -140,12 +149,11 @@ class RecurrentAWRAgent(object):
     #                 self.state_encoder.get_hidden(seq[0], start_hidden)
     #             )
 
-    def iter_update_combined(self, minibatch_iter, warmup_k=0, writer=None):
-        
+    def iter_update_combined(self, minibatch_iter, warmup_k=0, writer=None, value_update_mode='td(0)'):
         w_abs_max = 1.e4
 
         batch_policy_loss = 0.0
-        batch_value_loss = 0.0
+        log_value_loss = 0.0
         w_clip_count = 0
 
         torch.autograd.set_detect_anomaly(True)
@@ -160,32 +168,57 @@ class RecurrentAWRAgent(object):
         action_advantages = []
 
         for minibatch_no, mbatch in enumerate(minibatch_iter):
-            true_values = mbatch.val
 
             state_latent = self.state_encoder(mbatch.obs, return_hidden=False, check_grad=True)
             state_values = self.state_value(state_latent).clamp(-5e4, 5e4)
-            state_values = state_values
+
+            true_values = mbatch.val
             assert true_values.shape == state_values.shape
 
-            value_loss += F.mse_loss(true_values[:, warmup_k:], state_values[:, warmup_k:])
-            batch_value_loss += value_loss.detach().cpu().item()
+            if value_update_mode == 'mc':
+                if self.params['value_function_scaling'] == 'log1p':
+                    true_values = torch.log1p(true_values)
+                elif self.params['value_function_scaling'] in ('None', 'none', None):
+                    pass
+                else:
+                    raise ValueError("Invalid value for parameter \"value_function_scaling\" should be one of ['log1p', None].")
+                value_loss += F.mse_loss(true_values[:, warmup_k:], state_values[:, warmup_k:])
+            elif value_update_mode == 'td(0)':
+                value_loss += F.mse_loss(state_values[:,warmup_k:-1], mbatch.rew[:,warmup_k:-1] + self.params['gamma'] * state_values[:,warmup_k+1:].detach())
+            else:
+                raise ValueError("Invalid value for parameter \"value_update_mode\" should be one of ['mc', 'td(0)'].")
+            
+            log_value_loss += value_loss.detach().cpu().item()
 
             action_log_p.append(self.policy.log_p(state_latent, mbatch.act, writer=writer)[:, warmup_k:])
             action_advantages.append((true_values - state_values.detach())[:, warmup_k:])
+            # action_advantages.append((state_values))
+            # print(true_values.max())
             assert action_advantages[-1].shape == action_log_p[-1].shape
 
-        action_advantages = torch.cat(action_advantages).flatten()
-        action_log_p = torch.cat(action_log_p).flatten()
+        # action_advantages = torch.cat(action_advantages).flatten()
+        # action_log_p = torch.cat(action_log_p).flatten()
         
-        adv_mask = action_advantages < (self.params['beta']*np.log(w_abs_max))
-        action_advantages = action_advantages[adv_mask]
-        action_log_p = action_log_p[adv_mask]
+        # adv_mask = action_advantages < (self.params['beta']*np.log(w_abs_max))
+        # action_advantages = action_advantages[adv_mask]
+        # action_log_p = action_log_p[adv_mask]
         
-        action_advantages_normed = ((action_advantages - action_advantages.mean())/
-                             (action_advantages.std()+1.e-6))
+        # action_advantages_normed = ((action_advantages - action_advantages.mean())/
+        #                      (action_advantages.std()+1.e-6))
+        # pdb.set_trace()
+        # exp_advantages = torch.exp(action_advantages_normed / self.params['beta'])
+        # policy_loss = - (action_log_p * exp_advantages).mean()
 
+        action_advantages = torch.cat(action_advantages)
+        action_log_p = torch.cat(action_log_p)
+
+        # action_advantages_normed = (action_advantages - action_advantages.mean(axis=1, keepdim=True))/(1.e-7+action_advantages.std(axis=1,keepdim=True))
+        action_advantages_normed = (action_advantages - action_advantages.mean())/(1.e-7+action_advantages.std())
         exp_advantages = torch.exp(action_advantages_normed / self.params['beta'])
-        policy_loss = - (action_log_p * exp_advantages).mean()
+        policy_loss = -(action_log_p * exp_advantages).mean()
+        
+        # pdb.set_trace()
+
         
         total_loss = (policy_loss + value_loss)
         batch_policy_loss = policy_loss.detach().cpu().item()
@@ -204,9 +237,9 @@ class RecurrentAWRAgent(object):
 
         if writer:
             writer.add_scalar('update/batch_policy_loss', batch_policy_loss/(minibatch_no + 1), period=1)
-            writer.add_scalar('update/batch_value_loss', batch_value_loss/(minibatch_no + 1), period=1)
+            writer.add_scalar('update/batch_value_loss', log_value_loss/(minibatch_no + 1), period=1)
             writer.add_scalar('update/policy_loss_variety', exp_advantages.detach().std().cpu(), period=1)
-            writer.add_scalar('update/w_clip_count', sum(~adv_mask)/len(adv_mask), period=1)
+            # writer.add_scalar('update/w_clip_count', sum(~adv_mask)/len(adv_mask), period=1)
 
 
     # def iter_update_value(self, sequence_iter, writer = None):

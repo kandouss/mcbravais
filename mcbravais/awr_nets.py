@@ -217,7 +217,7 @@ class Encoder(nn.Module):
         return res
 
 class BoxPolicy(LoggingModule):
-    def __init__(self, latent_size, action_space, hidden_layer_sizes=[], log_std_bounds = (-8,-3)):
+    def __init__(self, latent_size, action_space, hidden_layer_sizes=[], log_std_bounds = (-8,-4)):
         super().__init__()
         self.space = action_space
         if not isinstance(action_space, gym.spaces.Box): raise ValueError

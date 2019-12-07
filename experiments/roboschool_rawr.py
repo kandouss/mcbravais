@@ -105,7 +105,8 @@ dino_bob = RecurrentAWRAgent(observation_space, action_space, params={
     'policy_trunk_hidden': [512, 512, 512],
     'value_function_hidden': [512, 512, 512],
     'beta': 1.0,
-    'learning_rate': 1.e-3
+    'learning_rate': 1.e-3,
+    'value_function_scaling': None
 })
 
 replay_buffer = RecurrentReplayBuffer(
